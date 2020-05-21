@@ -207,6 +207,7 @@ def host_scavenger(host_obj, arg_gsw, esxi_username='', esxi_password=''):
             df_h.at[(df_h['Host_Name'] == host_obj.name.split('.')[0]), 'Socket'+str(socket)+'_CPU_Occupation_%'] = host_instance.socketProvisionedvCPUs(socket)
         df_h.at[(df_h['Host_Name'] == host_obj.name.split('.')[0]), 'Socket'+str(socket)+'_Pinned_vMEM'], \
             df_h.at[(df_h['Host_Name'] == host_obj.name.split('.')[0]), 'Socket'+str(socket)+'_RAM_Occupation_%'] = host_instance.socketProvisionedRAM(socket)
+        #df_h['Host_Socket'+str(socket)+'_vCPUs'] = df_h['Host_Socket'+str(socket)+'_vCPUs'].astype(int)
     df_h.at[(df_h['Host_Name'] == host_obj.name.split('.')[0]), 'Model'] = host_instance.modelInfo_calculator()
     df_h.at[(df_h['Host_Name'] == host_obj.name.split('.')[0]), 'Provisioned_RAM'],\
         df_h.at[(df_h['Host_Name'] == host_obj.name.split('.')[0]), 'Total_RAM_Occupation_%'] = host_instance.provisionedRAM()
@@ -233,12 +234,6 @@ def host_scavenger(host_obj, arg_gsw, esxi_username='', esxi_password=''):
     if esxi_username and esxi_password:
         df_h_network = host_instance.connect_to_esxi(df_h_network, esxi_username, esxi_password)
     df_h_network = host_instance.vectorVF_calculator(df_h_network)
-
-    #response = requests.get('https://localhost:444/redfish/v1/Systems/System.Embedded.1',verify=False,auth=("user", "pass"))
-    #response = requests.get('https://localhost:444/redfish/v1/Systems/System.Embedded.1/NetworkInterfaces',verify=False,auth=("user", "pass"))
-    #response = requests.get('https://localhost:444/redfish/v1/Systems/System.Embedded.1/NetworkInterfaces/NIC.Integrated.1/NetworkPorts',verify=False,auth=("user", "pass"))
-    #data = response.json()
-    #print(data)
 
     return df_vms, df_h, df_h_network
 
@@ -502,33 +497,33 @@ def addSortFunctionJs(html, tableName):
     ----------
     html : string
         HTML code as returned by Pandas.Style.render()
+    tableName : string
+        HTML table name  
     Returns
     -------
     new_html
         Input HTML code with a sorting JS function and "onclick" data in each "th" Tag
     """
 
-    tableID = tableName
-
-    # This line should take tableID from the above variable______ REVIEW
-    ## table = document.getElementById("T_{html_vm_tableID});
+    # As we are using "format" to embed a variable in the JS code, the curly braces in that code must be doubled so that they are scaped.
+    # Doubling up those curly braces escapes them; the final output will contain single { and } characters again
     javascript_sort_function = """
         <script>
-            function sortTable(n) {
+            function sortTable(n) {{
                 var table, rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
-                table = document.getElementById("T_myTable");
+                table = document.getElementById("T_{table}");
                 switching = true;
                 //Set the sorting direction to ascending:
                 dir = "asc"; 
                 /*Make a loop that will continue until
                 no switching has been done:*/
-                while (switching) {
+                while (switching) {{
                     //start by saying: no switching is done:
                     switching = false;
                     rows = table.rows;
                     /*Loop through all table rows (except the
                     first, which contains table headers):*/
-                    for (i = 1; i < (rows.length - 1); i++) {
+                    for (i = 1; i < (rows.length - 1); i++) {{
                         //start by saying there should be no switching:
                         shouldSwitch = false;
                         /*Get the two elements you want to compare,
@@ -541,39 +536,39 @@ def addSortFunctionJs(html, tableName):
                         cmpY=(cmpY=='-')?0:cmpY;
                         /*check if the two rows should switch place,
                         based on the direction, asc or desc:*/
-                        if (dir == "asc") {
-                            if (cmpX > cmpY) {
+                        if (dir == "asc") {{
+                            if (cmpX > cmpY) {{
                                 //if so, mark as a switch and break the loop:
                                 shouldSwitch= true;
                                 break;
-                            }
-                        } else if (dir == "desc") {
-                            if (cmpX < cmpY) {
+                            }}
+                        }} else if (dir == "desc") {{
+                            if (cmpX < cmpY) {{
                                 //if so, mark as a switch and break the loop:
                                 shouldSwitch = true;
                                 break;
-                            }
-                        }
-                    }
-                    if (shouldSwitch) {
+                            }}
+                        }}
+                    }}
+                    if (shouldSwitch) {{
                         /*If a switch has been marked, make the switch
                         and mark that a switch has been done:*/
                         rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
                         switching = true;
                         //Each time a switch is done, increase this count by 1:
                         switchcount ++;      
-                    } else {
+                    }} else {{
                         /*If no switching has been done AND the direction is "asc",
                         set the direction to "desc" and run the while loop again.*/
-                        if (switchcount == 0 && dir == "asc") {
+                        if (switchcount == 0 && dir == "asc") {{
                             dir = "desc";
                             switching = true;
-                        }
-                    }
-                }
-            }
+                        }}
+                    }}
+                }}
+            }}
         </script>
-    """
+    """.format(table = tableName)
 
     html = html.replace('</th>','</th>\n')
 
@@ -586,8 +581,100 @@ def addSortFunctionJs(html, tableName):
     new_html = html + '\n' + javascript_sort_function
 
     new_html = addStickyHeaderCSS(new_html)
+    new_html = addColumnDraggable(new_html, tableName)
+    new_html = addSeachField(new_html, tableName)
 
     return new_html
+
+def addColumnDraggable(new_html, tableName):
+    """Make table columns draggable.
+    
+    Parameters
+    ----------
+    new_html : string
+        HTML code
+    tableName : string
+        HTML table name
+    Returns
+    -------
+    draggable_table
+        Input HTML code with JS script reference to make table columns draggable
+    """
+
+    js_url = "http://www.danvk.org/dragtable/dragtable.js"
+    js_script = f'<script src={js_url}></script>'
+
+    draggable_table = re.sub(fr'(table id="T_{tableName}")',fr'\1 class="draggable"', new_html)
+    draggable_table = re.sub(r'(</style>)',fr'\1\n{js_script}\n', draggable_table)
+
+    return draggable_table
+
+def addSeachField(new_html, tableName):
+    """Add a HTML seach input field.
+    
+    Parameters
+    ----------
+    new_html : string
+        HTML code
+    tableName : string
+        HTML table name
+    Returns
+    -------
+    searchable_table
+        Input HTML code with JS, CSS and HTML code to add a seach input field
+    """
+    # As we are using "format" to embed a variable in the JS code, the curly braces in that code must be doubled so that they are scaped.
+    # Doubling up those curly braces escapes them; the final output will contain single { and } characters again
+    js_search_function = """
+    		<script>
+                function searchFunction() {{
+                // Declare variables
+                var input, filter, table, tr, td, i, txtValue;
+                input = document.getElementById("myInput");
+                filter = input.value.toUpperCase();
+                table = document.getElementById("T_{table}");
+                tr = table.getElementsByTagName("tr");
+
+                // Loop through all table rows, and hide those who don't match the search query
+                for (i = 0; i < tr.length; i++) {{
+                    td = tr[i].getElementsByTagName("td")[0];
+                    if (td) {{
+                    txtValue = td.textContent || td.innerText;
+                    if (txtValue.toUpperCase().search(filter) > -1) {{
+                        tr[i].style.display = "";
+                    }} else {{
+                        tr[i].style.display = "none";
+                    }}
+                    }}
+                }}
+                }}
+            </script>
+    """.format(table = tableName)
+
+    css_input_field = """
+    	#myInput {
+            background-image: url("https://img.icons8.com/metro/26/000000/search.png"); /* Add a search icon to input */
+            background-position: 10px 8px; /* Position the search icon */
+            background-repeat: no-repeat; /* Do not repeat the icon image */
+            width: 50%; /* Full-width */
+            font-size: 14px; /* Increase font-size */
+            padding: 12px 20px 12px 40px; /* Add some padding */
+            border: 1px solid #ddd; /* Add a grey border */
+            margin-bottom: 12px; /* Add some space below the input */
+        }
+    """
+
+    if "Host" in tableName:
+        var = "Host"
+    elif "VM" in tableName:
+        var = "VM"
+
+    html_input_field = f'<input type="text" id="myInput" onkeyup="searchFunction()" placeholder="Search for {var} names (REGEX)...">'
+    
+    searchable_table = new_html + '\n' + js_search_function
+    searchable_table = re.sub(r'(</style>)',fr'{css_input_field}\n\1\n{html_input_field}\n', searchable_table)
+
+    return searchable_table
 
 def writeOuputDataframes(queryObject, queryName, df_vms=pd.DataFrame(), df_hosts=pd.DataFrame(), df_hosts_network=pd.DataFrame(), df_clusters=pd.DataFrame(), df_datacenters=pd.DataFrame()):
     """Write output dataframes to HTML and CSV files.
@@ -610,32 +697,34 @@ def writeOuputDataframes(queryObject, queryName, df_vms=pd.DataFrame(), df_hosts
         vCenter object number under analysis as per received arguments
     """
 
-    html_tableID = 'myTable'
+    #html_tableID = 'myTable'
 
     current_time = datetime.datetime.now()
     time_suffix = str(current_time.year) + str(current_time.month) + str(current_time.day) + str(current_time.hour) + str(current_time.minute)
 
     df_vms.fillna('',inplace=True)
     if not df_vms.empty:
+        html_tableID = 'myVMTable'
         df_vms = df_vms.infer_objects() # Automatically convert each DF column to the appropiate type
         html_vms = (df_vms.style.hide_index()
                                 # set_table_styles contains CSS attributes applied to each table element (header, link, etc.) and situation (hover)
                                 ## Modify CSS attributes as mouse hovers over table entries
                                 ## Modify CSS attributes for Text Header (dataframe column names)
-                                .set_table_styles([{'selector': 'th', 'props': [('background-color', '#4CAF50'),('color', 'white'),('padding', '5px'),('font-size', '10pt'), ('cursor', 'pointer')]},
+                                # Green background for column names: ('background-color', '#4CAF50')
+                                .set_table_styles([{'selector': 'th', 'props': [('background-color', 'black'),('color', 'white'),('padding', '5px'),('font-size', '11pt'), ('cursor', 'pointer')]},
                                                     #{'selector': 'tr:nth-child(even)', 'props': [('background-color', '#f2f2f2')]},
                                                     #{'selector': 'tr:nth-child(odd)', 'props': [('background-color', 'lightgray')]},
-                                                    {'selector': 'tr:hover', 'props': [('background-color', 'yellow')]},
-                                                    {'selector': 'tr', 'props': [('font-size', '10pt'),('background-color', 'white')]}
+                                                    {'selector': 'tr:hover', 'props': [('background-color', 'gold')]},
+                                                    {'selector': 'tr', 'props': [('font-size', '11pt'), ('background-color', 'White')]}
                                                     ])                                 
                                 .set_properties(**{'text-align': 'right', 'border-color': 'black', 'border-style': 'solid', 'border-width': '1px'})  # Set some table properties
                                 #.highlight_max(color='orange')
-                                .apply(lambda x: ["background-color: silver" for index, value in enumerate(x)], axis = 0, subset=['VM_Name'])
+                                .apply(lambda x: ["background-color: YellowGreen" for index, value in enumerate(x)], axis = 0, subset=['VM_Name'])
                                 #.apply(lambda x: ["color: white" for index, value in enumerate(x)], axis = 0, subset=['VM_Name'])
                                 .bar(subset=['VM_vCPU'], color='#08D8C3')
                                 .bar(subset=['VM_vMEM_GB'], color='lightgreen')
                                 .bar(subset=['VM_Provisioned_Storage_GB'], color='#0855D8')
-                                .bar(subset=['VM_Space_In_Disk_GB'], color='#FFD700')
+                                .bar(subset=['VM_Space_In_Disk_GB'], color='deepskyblue')
                                 .bar(subset=['SRIOV_vNICs'], color='#D1D86C')
                                 .bar(subset=['VMXNET3_vNICs'], color='moccasin')
                                 .bar(subset=['PCIPT_vNICs'], color='aquamarine')
@@ -662,21 +751,22 @@ def writeOuputDataframes(queryObject, queryName, df_vms=pd.DataFrame(), df_hosts
 
     df_hosts.fillna('',inplace=True)
     if not df_hosts.empty:
+        html_tableID = 'myHostTable'
         df_hosts = df_hosts.infer_objects() # Automatically convert each DF column to the appropiate type
         html_hosts = (df_hosts.style.hide_index()
                                 # set_table_styles contains CSS attributes applied to each table element (header, link, etc.) and situation (hover)
                                 ## Modify CSS attributes as mouse hovers over table entries
                                 ## Modify CSS attributes for Text Header (dataframe column names)
-                                .set_table_styles([{'selector': 'th', 'props': [('background-color', '#4CAF50'),('color', 'white'),('padding', '5px'),('font-size', '10pt'), ('cursor', 'pointer')]},
-                                                    {'selector': 'tr:hover', 'props': [('background-color', 'yellow')]},
-                                                    {'selector': 'tr', 'props': [('font-size', '10pt')]}
+                                .set_table_styles([{'selector': 'th', 'props': [('background-color', 'black'),('color', 'white'),('padding', '5px'),('font-size', '11pt'), ('cursor', 'pointer')]},
+                                                    {'selector': 'tr:hover', 'props': [('background-color', 'gold')]},
+                                                    {'selector': 'tr', 'props': [('font-size', '11pt'), ('background-color', 'White')]}
                                                     ])   
-                                .set_properties(**{'text-align': 'right', 'border-color': 'black', 'border-style': 'solid', 'border-width': '1px', 'font-size': '10pt'})  # Set some table properties
-                                .apply(lambda x: ["background-color: silver" for index, value in enumerate(x)], axis = 0, subset=['Host_Name'])
+                                .set_properties(**{'text-align': 'right', 'border-color': 'black', 'border-style': 'solid', 'border-width': '1px', 'font-size': '11pt'})  # Set some table properties
+                                .apply(lambda x: ["background-color: YellowGreen" for index, value in enumerate(x)], axis = 0, subset=['Host_Name'])
                                 .bar(subset=['Provisioned_vCPUs'], color='#08D8C3')
                                 .bar(subset=['Provisioned_RAM'], color='lightgreen')
                                 .bar(subset=['Datastore_Provisioned_GB'], color='#0855D8')
-                                .bar(subset=['RealTime_vCPUs'], color='#FFD700')
+                                .bar(subset=['RealTime_vCPUs'], color='deepskyblue')
                                 .bar(subset=['SRIOV_VMs'], color='#D1D86C')
                                 .bar(subset=['Datastore_MixedSpace_GB'], color='lime')
                                 .background_gradient(subset=['RealTime_Occupation_%'], cmap='Greys')    # Matplotlib colormaps "https://matplotlib.org/examples/color/colormaps_reference.html"
@@ -712,20 +802,21 @@ def writeOuputDataframes(queryObject, queryName, df_vms=pd.DataFrame(), df_hosts
 
     df_hosts_network.fillna('',inplace=True)
     if not df_hosts_network.empty:
+        html_tableID = 'myHostNetworkingTable'
         html_hosts_network = (df_hosts_network.style
                                 .hide_index()
                                 # set_table_styles contains CSS attributes applied to each table element (header, link, etc.) and situation (hover)
                                 ## Modify CSS attributes as mouse hovers over table entries
                                 ## Modify CSS attributes for Text Header (dataframe column names)
-                                .set_table_styles([{'selector': 'th', 'props': [('background-color', '#4CAF50'),('color', 'white'),('padding', '5px'),('font-size', '10pt'), ('cursor', 'pointer')]},
-                                                    {'selector': 'tr:hover', 'props': [('background-color', 'yellow')]},
-                                                    {'selector': 'tr', 'props': [('font-size', '10pt')]}
+                                .set_table_styles([{'selector': 'th', 'props': [('background-color', 'black'),('color', 'white'),('padding', '5px'),('font-size', '11pt'), ('cursor', 'pointer')]},
+                                                    {'selector': 'tr:hover', 'props': [('background-color', 'gold')]},
+                                                    {'selector': 'tr', 'props': [('font-size', '11pt'), ('background-color', 'White')]}
                                                     ])   
-                                .set_properties(**{'text-align': 'right', 'border-color': 'black', 'border-style': 'solid', 'border-width': '1px', 'font-size': '10pt'})  # Set some table properties
-                                .apply(lambda x: ["background-color: silver" for index, value in enumerate(x)], axis = 0, subset=['Host_Name'])
+                                .set_properties(**{'text-align': 'right', 'border-color': 'black', 'border-style': 'solid', 'border-width': '1px', 'font-size': '11pt'})  # Set some table properties
+                                .apply(lambda x: ["background-color: YellowGreen" for index, value in enumerate(x)], axis = 0, subset=['Host_Name'])
                                 .apply(lambda x: ["background-color: lightblue" if (value == "dVS") else "" for index, value in enumerate(x)], axis = 0, subset=['vmnic_Type'])
                                 .apply(lambda x: ["background-color: lightgreen" if (value == "SR-IOV") else "" for index, value in enumerate(x)], axis = 0, subset=['vmnic_Type'])
-                                .apply(lambda x: ["background-color: orange" if (value == "PCI-PT") else "" for index, value in enumerate(x)], axis = 0, subset=['vmnic_Type']) 
+                                .apply(lambda x: ["background-color: yellow" if (value == "PCI-PT") else "" for index, value in enumerate(x)], axis = 0, subset=['vmnic_Type']) 
                                 .apply(lambda x: ["background-color: red" if (value and (value != 0) and (df_hosts_network.at[index, 'vmnic_Type'] != 'SR-IOV')) else "" for index, value in enumerate(x)], axis = 0, subset=['vmnic_configured_VFs'])
                                 .apply(lambda x: ["background-color: red" if value != df_hosts_network.at[index, 'Host_calculated_VF_Vector'] else "" for index, value in enumerate(x)], axis = 0, subset=['Host_current_VF_Vector'])
                                 .set_uuid(html_tableID)

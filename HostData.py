@@ -10,7 +10,7 @@ class HostData:
     def modelInfo_calculator(self):
         """Return Host model."""
 
-        return self.host_obj.hardware.systemInfo.model
+        return self.host_obj.hardware.systemInfo.model.replace(' ','_')
     
     def clustername_calculator(self):
         """Return the name of the Cluster to which the host belongs."""
@@ -258,7 +258,7 @@ class HostData:
 
         for pciDevice in self.host_obj.config.pciPassthruInfo:
             try:    # PCI devices which are not NICs do not have the following attributes
-                if pciDevice.sriovEnabled and pciDevice.sriovActive:    # PCI Devices configured as SR-IOV
+                if pciDevice.sriovActive:    # PCI Devices configured as SR-IOV
                     df_h_network.at[(df_h_network['vmnic_Device'] == pciDevice.id), 'vmnic_Type'] = "SR-IOV"
                     df_h_network.at[(df_h_network['vmnic_Device'] == pciDevice.id), 'vmnic_max_VFs'] = pciDevice.maxVirtualFunctionSupported   
                 elif pciDevice.passthruEnabled and pciDevice.passthruActive and pciDevice.id == pciDevice.dependentDevice:  # PCI Devices configured as PCI-PT
@@ -352,7 +352,7 @@ class HostData:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(hostname=self.host_obj.name, username=esxi_username, password=esxi_password)
 
-            # Code to get current SRIOV VFs vector in host
+            # Code to get current i40en VFs vector in host
             pattern_vector = re.compile(r'max_vfs.* ([0-9,]+)')
             stdin, stdout, stderr = client.exec_command('esxcli system module parameters list -m i40en')
             vector = stdout.read().decode('ascii').strip("\n")
@@ -390,6 +390,42 @@ class HostData:
             print("ESXi connection failure")
 
         return df_h_network
+
+    def idrac_info(self, df_h_network):
+        """Collect iDRAC info for PCIe NIC Devices."""
+
+        #df_grouped = df_h_network.groupby('Host_Name')
+        #print(df_grouped['Host_Name'])
+        idracName = self.host_obj.name.split('.')[0].replace('hv','rs')
+        print(idracName)
+        #host = idracName
+        host = idracName
+        user = ""
+        passw = ""
+
+        hwinventory = ""
+
+        #Connect to remote host
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(hostname=host, username=user,password=passw)
+            stdin, stdout, stderr = client.exec_command('hwinventory')
+            hwinventory = stdout.read()
+            print(hwinventory)
+        except:
+            pass
+        """
+        commands = ["racadm", "hwinventory"]
+
+        for command in commands:
+            stdin, stdout, stderr = client.exec_command('hwinventory')
+            hwinventory = stdout.read().decode()
+            print(stdout.read().decode()) 
+        """
+        return hwinventory
+
+
 
 
 

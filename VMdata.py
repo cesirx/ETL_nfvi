@@ -11,6 +11,7 @@ class VMdata:
     def actualUsage_calculator(self):
         """Return the actual storage space (GB) consumed by a given VM."""
 
+        #snap_re = re.compile('-[0-9]{6}')
         actual_size = 0
         for file in self.vm_obj.layoutEx.file:
             if ('snapshot' not in file.name.lower()) and ('delta' not in file.name.lower() and not re.search('-[0-9]{6}',file.name.lower())): # Excluding snapshot files from actual disk usage to get an accurate VM storage consumption
@@ -170,7 +171,7 @@ class VMdata:
 
 
     def realtime_calculator(self):
-        """Return "YES" if VM is in GOLD ResourcePool. Else return "NO"."""
+        """Return "YES" if VM is Realtime (GOLD ResourcePool). Else return "NO"."""
 
         try:
             resourcePool = self.vm_obj.resourcePool.name
@@ -262,7 +263,7 @@ class VMdata:
 
     def sriovVirtualInterfaces_calculator(self):
         """Return the amount of SRIOV vNICs in current VM."""
-
+ 
         sriov_vnics_count = 0
         for device in self.vm_obj.config.hardware.device:
             if "SR-IOV" in device.deviceInfo.label:
