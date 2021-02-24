@@ -1,5 +1,7 @@
-import re, paramiko, getpass
+import re, paramiko, getpass, json, requests, urllib3
+from datetime import datetime, timezone
 
+urllib3.disable_warnings()  # To disable HTTPS security warnings when cert validation is disabled
 class HostData:
     'Retrieve Host configuration data'
 
@@ -10,8 +12,13 @@ class HostData:
     def modelInfo_calculator(self):
         """Return Host model."""
 
-        return self.host_obj.hardware.systemInfo.model.replace(' ','_')
+        return self.host_obj.hardware.systemInfo.model
     
+    def hostMOID_calculator(self):
+        """Return the MOID of the Host."""
+
+        return self.host_obj._moId
+
     def clustername_calculator(self):
         """Return the name of the Cluster to which the host belongs."""
 
@@ -64,8 +71,8 @@ class HostData:
         socket_total_pcpus = round(self.host_obj.summary.hardware.numCpuThreads / self.host_obj.summary.hardware.numCpuPkgs)  # If SMT is active pCPU means Thread/LCPU. If SMT is disabled pCPU means Core
 
         if not self.df_vms.empty:
-            vcpus_socket_regular_vms = self.df_vms[(self.df_vms['VM_NumaNode'] == str(socket)) & (self.df_vms['VM_LatencySensitivity'] == 'normal')]['VM_vCPU'].sum()
-            vcpus_socket_ls_vms = self.df_vms[(self.df_vms['VM_NumaNode'] == str(socket)) & (self.df_vms['VM_LatencySensitivity'] == 'high')]['VM_vCPU'].sum()
+            vcpus_socket_regular_vms = self.df_vms[(self.df_vms['VM_NUMA'] == str(socket)) & (self.df_vms['VM_LatencySensitivity'] == 'normal')]['VM_vCPU'].sum()
+            vcpus_socket_ls_vms = self.df_vms[(self.df_vms['VM_NUMA'] == str(socket)) & (self.df_vms['VM_LatencySensitivity'] == 'high')]['VM_vCPU'].sum()
             socket_provisioned_vcpus = vcpus_socket_regular_vms + vcpus_socket_ls_vms*2    # LS vCPUs count double as LS provides core isolation
             current_socket_occupation_percentage = round(socket_provisioned_vcpus*100/socket_total_pcpus)
         else:
@@ -117,7 +124,7 @@ class HostData:
 
         socket_mem_GB = int(host_total_ram_GB / self.host_obj.hardware.numaInfo.numNodes)
         if not self.df_vms.empty:
-            socket_provisioned_vmem = self.df_vms[self.df_vms['VM_NumaNode'] == str(socket)]['VM_vMEM_GB'].sum()
+            socket_provisioned_vmem = self.df_vms[self.df_vms['VM_NUMA'] == str(socket)]['VM_vMEM_GB'].sum()
             current_socket_occupation_percentage = round(socket_provisioned_vmem*100/socket_mem_GB)
         else:
             socket_provisioned_vmem = 0
@@ -129,7 +136,7 @@ class HostData:
         """Calculate max host occupation ratio according to host type."""
 
         oversubscription_factor = {"A":1, "B":3, "C":3, "D":3, "F":1}     # Host oversubscription ratio depends on Cluster type (A, B, C or D). Type "F" hosts are not considered
-        pattern_cl = re.compile(r'CL_[A-Z]*_([A-Z]{1})_.*')      # Regex pattern matching InfraV cluster naming
+        pattern_cl = re.compile(r'CL_[A-Z]*_([A-Z]{1})_.*')      # Regex pattern matching cluster naming
         pattern_match = pattern_cl.search(self.host_obj.parent.name)
         if pattern_match:
             factor = oversubscription_factor[pattern_match.group(1)] * 100
@@ -248,8 +255,8 @@ class HostData:
 
         for pnic in self.host_obj.config.network.pnic:
             if "vmnic" in pnic.device:
-                df_h_network = df_h_network.append({'Host_Name': self.host_obj.name.split('.')[0],'vmnic_Name': pnic.device, 'vmnic_Driver': pnic.driver, \
-                    'vmnic_MAC': pnic.mac, 'vmnic_Device': pnic.pci, 'vmnic_Link': 'up' if pnic.spec.linkSpeed else 'down'}, ignore_index=True)
+                df_h_network = df_h_network.append({'Host_Name': self.host_obj.name.split('.')[0], 'MOID': self.host_obj._moId, 'vmnic_Name': pnic.device, 'vmnic_Driver': pnic.driver, \
+                    'vmnic_MAC': pnic.mac, 'vmnic_Device': pnic.pci, 'vmnic_Link_Status': 'up' if pnic.linkSpeed else 'down', 'vmnic_Configured_Speed_Mbps': pnic.spec.linkSpeed.speedMb if pnic.spec.linkSpeed else 'Auto'}, ignore_index=True)
 
         return df_h_network
 
@@ -275,7 +282,7 @@ class HostData:
                             pciNumber = int(siblingNumber) - functionDrift
                             pcivmnic = "vmnic" + str(pciNumber)
                             break
-                    df_h_network = df_h_network.append({'Host_Name': self.host_obj.name.split('.')[0], 'vmnic_Name': pcivmnic, 'vmnic_Device': pciDevice.id, 'vmnic_Type': "PCI-PT"}, ignore_index=True)
+                    df_h_network = df_h_network.append({'Host_Name': self.host_obj.name.split('.')[0], 'MOID': self.host_obj._moId, 'vmnic_Name': pcivmnic, 'vmnic_Device': pciDevice.id, 'vmnic_Type': "PCI-PT"}, ignore_index=True)
 
                 df_h_network.at[(df_h_network['vmnic_Device'] == pciDevice.id), 'vmnic_configured_VFs'] = pciDevice.numVirtualFunction  # These are the values used for the "max_vfs" vector
             except:
@@ -293,14 +300,14 @@ class HostData:
                 for nic in dvsNics: 
                     df_h_network.at[df_h_network['vmnic_Name']==nic, 'vmnic_Type'] = "dVS"
                     df_h_network.at[df_h_network['vmnic_Name']==nic, 'vmnic_virtualSwitch'] = dvs.dvsName
+
+            for vswitch in self.host_obj.config.network.vswitch:
+                switchNics = vswitch.spec.policy.nicTeaming.nicOrder.activeNic + vswitch.spec.policy.nicTeaming.nicOrder.standbyNic
+                for nic in switchNics: 
+                    df_h_network.at[df_h_network['vmnic_Name']==nic, 'vmnic_Type'] = "vSwitch"
+                    df_h_network.at[df_h_network['vmnic_Name']==nic, 'vmnic_virtualSwitch'] = vswitch.name
         except:
             pass
-
-        for vswitch in self.host_obj.config.network.vswitch:
-            switchNics = vswitch.spec.policy.nicTeaming.nicOrder.activeNic + vswitch.spec.policy.nicTeaming.nicOrder.standbyNic
-            for nic in switchNics: 
-                df_h_network.at[df_h_network['vmnic_Name']==nic, 'vmnic_Type'] = "vSwitch"
-                df_h_network.at[df_h_network['vmnic_Name']==nic, 'vmnic_virtualSwitch'] = vswitch.name
 
         return df_h_network
 
@@ -313,11 +320,19 @@ class HostData:
         
         return df_h_network
 
+    def timestamp_calculator(self):
+        """Return current timestamp in ISO8601 format.""" 
+
+        current_time = datetime.now(timezone.utc)
+
+        return current_time.isoformat()
+
     def pciDevice_Model(self, df_h_network):
         """Resturn the PCI card model of each vmnic."""
 
         for pciDevice in self.host_obj.hardware.pciDevice:  
-            df_h_network.at[(df_h_network['vmnic_Device'] == pciDevice.id), 'vmnic_Model'] = pciDevice.deviceName.replace(' ','_')
+            #df_h_network.at[(df_h_network['vmnic_Device'] == pciDevice.id), 'vmnic_Model'] = pciDevice.deviceName.replace(' ','_').replace('-','_')
+            df_h_network.at[(df_h_network['vmnic_Device'] == pciDevice.id), 'vmnic_Model'] = pciDevice.deviceName
 
         return df_h_network
 
@@ -337,28 +352,88 @@ class HostData:
         #print(df_h_network[['vmnic_Device', 'vmnic_Name', 'vmnic_Type', 'vmnic_configured_VFs', 'Host_calculated_VF_Vector']])
         vector = ['0' if row['vmnic_Type'] != 'SR-IOV' else row['vmnic_configured_VFs'] for index, row in df_h_network[df_h_network['vmnic_Driver'] == 'i40en'].iterrows()]
         string_vector = ','.join((str(v) for v in vector))
+        trusted_vector = re.sub('[1-9][0-9]*', '1', string_vector)
         df_h_network = df_h_network.drop(columns=['order'])
         df_h_network['Host_calculated_VF_Vector'] = string_vector
+        df_h_network['Host_calculated_Trusted_Vector'] = trusted_vector
         df_h_network = df_h_network.sort_index()    # Found some problems with the Apply function of the Styler if df is not sorted by index
 
         return df_h_network
 
-    def connect_to_esxi(self, df_h_network, esxi_username, esxi_password):
-        """Connect to ESXi to retrieve addition pNIC information."""
+    """
+    def getGSW_info(df_h_network, gsw_name, gsw_username, gsw_password):
+        #Retrieve physical port information for pNICs.
+
+        jump_server = "10.30.190.207"
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(hostname=jump_server, username=gsw_username, password=gsw_password)
+            stdin, stdout, stderr = client.exec_command('ls -l')
+            print(stderr.read())
+            lldp = stdout.read()
+            print(lldp)
+        except:
+            print("Connection failure")
+
+        return df_h_network
+
+    def connect_to_GSW(self, df_h_network):
+        #Connect to phyisical network switches.
+
+        try:
+            gsw_username = input('Enter GSW username: ')
+            gsw_password = getpass.getpass(prompt='Enter GSW password: ')
+
+            pop_name = self.host_obj.name.split('.')[0][-7:-2]
+            gsw_range = ["1","2"]
+            for i in gsw_range:
+                gsw_name = "GSW" + pop_name.upper() + i
+                print(gsw_name) 
+                df_h_network = getGSW_info(df_h_network, gsw_name, gsw_username, gsw_password)         
+        except:
+            pass
+
+        return df_h_network
+    """
+
+    def connect_to_esxi(self, df_h_network, df_h, df_vms_network, esxi_username, esxi_password):
+        """Connect to ESXi to retrieve additional information."""
 
         try:
             client = paramiko.SSHClient()
             client.load_system_host_keys()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(hostname=self.host_obj.name, username=esxi_username, password=esxi_password)
+            client.connect(hostname=self.host_obj.name, username=esxi_username, password=esxi_password, timeout=10)
+        except:
+            print(f"{self.host_obj.name} ESXi connection failure")
+        else:
+            # Code to get PCIPT|SRIOV to vmnic mapping
+            stdin, stdout, stderr = client.exec_command('vmkchdev -l | grep vmnic')
+            pt = stdout.read().decode('ascii').strip("\n")
+            #pattern_pcipt = re.compile('([0-9:.]*) [0-9:]* [a-z0-9:]* (?:passthru|vmkernel) (vmnic[0-9]*)')
+            for pci_device in df_h_network['vmnic_Device']:
+                pattern_pcipt = re.compile(f'({pci_device}) [0-9:]* [a-z0-9:]* (?:passthru|vmkernel) (vmnic[0-9]*)')
+                p = pattern_pcipt.search(pt)
+                if p:
+                    df_h_network.at[(df_h_network['vmnic_Device'] == p.group(1)) & (df_h_network['vmnic_Name'] == ''),'vmnic_Name'] = p.group(2)
+                    if not df_vms_network.empty:
+                        df_vms_network.at[(df_vms_network['pNIC_PCI_Device'] == p.group(1)) & (df_vms_network['pNIC_inUse'] == ''), 'pNIC_inUse'] = p.group(2)
+                    #print(df_vms_network[(df_vms_network['pNIC_PCI_Device'] == p.group(1))][['pNIC_PCI_Device', 'pNIC_inUse']])
 
-            # Code to get current i40en VFs vector in host
+            # Code to get current i40en VFs and Trusted vector in host
             pattern_vector = re.compile(r'max_vfs.* ([0-9,]+)')
             stdin, stdout, stderr = client.exec_command('esxcli system module parameters list -m i40en')
             vector = stdout.read().decode('ascii').strip("\n")
             m = pattern_vector.search(vector)
             if m:
                 df_h_network['Host_current_VF_Vector'] = m.group(1)
+            
+            pattern_trusted = re.compile(r'trust_all_vfs.* ([0-9,]{2,})')
+            n = pattern_trusted.search(vector)
+            if n:
+                df_h_network['Host_current_Trusted_Vector'] = n.group(1)
 
             # Code to match PCI Device B:D:F to vmnic name
             stdin, stdout, stderr = client.exec_command('lspci | grep vmnic')
@@ -386,46 +461,364 @@ class HostData:
                 if n:
                     df_h_network.at[index, 'vmnic_Firmware_version']= n.group(1)
 
+            # Code to get ISM VIC version
+            stdin, stdout, stderr = client.exec_command('esxcli software vib list | grep ism')
+            ism_version = stdout.read().decode('ascii').strip("\n")
+            ism_version = re.sub(' +', ' ', ism_version)  # Replacing multiple consecutive spaces with only one
+            if ism_version:
+                    df_h['VIB_ISM_Version'] = ism_version.split(' ')[1]
+            
+            # Code to get current Team Uplink for each dVS vNIC and add it to the df_vms_network dataframe
+            if not df_vms_network.empty:
+                for vm in df_vms_network[df_vms_network['Host_Name']==self.host_obj.name.split('.')[0]]['VM_Name'].unique():
+                    stdin, stdout, stderr = client.exec_command(f'esxcli network vm list | grep {vm} | awk \'{{print $1}}\'')
+                    vm_world = stdout.read().decode('ascii').strip("\n")
+                    if vm_world:
+                        stdin, stdout, stderr = client.exec_command(f'esxcli network vm port list -w {vm_world}')
+                        vnics = stdout.read().decode('ascii').strip("\n")
+                        for mac in df_vms_network[df_vms_network['VM_Name']==vm]['vNIC_MAC']:
+                            pattern_teamUplink = re.compile(rf' *Port ID: ([0-9]*)\n *vSwitch: [a-zA-Z0-9_-]*\n *Portgroup: [a-zA-Z0-9_-]*\n *DVPort ID: [0-9]*\n *MAC Address: ({mac})\n *IP Address: [0-9.]*\n *Team Uplink: (vmnic[0-9]*)')
+                            #pattern_teamUplink = re.compile(rf' *MAC Address: ({mac})\n *IP Address: [0-9.]*\n *Team Uplink: (vmnic[0-9]*)')
+                            m = pattern_teamUplink.search(vnics)
+                            if m:
+                                df_vms_network.at[df_vms_network['vNIC_MAC'] == m.group(2), 'pNIC_inUse'] = m.group(3)
+                                stdin, stdout, stderr = client.exec_command(f'vsish -e  get /net/portsets/DvsPortset-0/ports/{m.group(1)}/vmxnet3/rxSummary')
+                                portSummary = stdout.read().decode('ascii').strip("\n")
+                                pattern_ringSize = re.compile('1st ring size:([0-9]*)')
+                                pattern_ringFull = re.compile('# of times the 1st ring is full:([0-9]*)')
+                                r = pattern_ringSize.search(portSummary)
+                                if r:
+                                    df_vms_network.at[df_vms_network['vNIC_MAC'] == m.group(2), 'vNIC_rxBuffer_Ring1_bytes'] = r.group(1)
+                                s = pattern_ringFull.search(portSummary)
+                                if s:
+                                    df_vms_network.at[df_vms_network['vNIC_MAC'] == m.group(2), 'vNIC_rxBuffer_Ring1_fullTimes'] = s.group(1)
+
+
+        return df_h_network, df_h, df_vms_network
+
+    def idrac_PCIeDeviceInfo(self, df_h_network, idrac_username, idrac_password):
+        """Collect iDRAC info."""
+
+        idracName = self.host_obj.name.replace('hv','rs')
+        try:
+            #print("\n- WARNING, server PCIe Function URIs for iDRAC %s\n" % idracName)
+            req = requests.get('https://%s/redfish/v1/Systems/System.Embedded.1' % (idracName), auth=(idrac_username, idrac_password), verify=False)
+            statusCode = req.status_code
         except:
-            print("ESXi connection failure")
+            print(f"{idracName} iDRAC connection failure")
+        else:
+            try:
+                data = req.json()
+                pcie_devices=[]
+                for i in data[u'PCIeFunctions']:
+                    for ii in i.items():
+                        #print(ii[1])
+                        pcie_devices.append(ii[1])
+                for i in pcie_devices:
+                    req = requests.get('https://%s%s' % (idracName, i), auth=(idrac_username, idrac_password), verify=False)
+                    statusCode = req.status_code
+                    data = req.json()
+                    #message = "\n\n- Detailed information for URI \"%s\"\n\n" % i
+                    #print(message)
+                    nic = 'False'
+                    pci_bdf_hex = ''
+                    ethernet_port_slot = ''
+                    for ii in data.items():
+                        #device = "%s: %s" % (ii[0], ii[1])
+                        #print(device)
+                        if ii[0] == '@odata.id':
+                            pci_bdf_dec = ii[1].split('/')[-1]
+                            pci_b_dec = pci_bdf_dec.split('-')[0]
+                            pci_b_hex = format(int(pci_b_dec), 'x').zfill(2)    # zfill() method to pad a string with zeros
+                            pci_bdf_hex = re.sub(f'{pci_b_dec}-', f'{pci_b_hex}-', pci_bdf_dec).replace('-',':')
+                            last_quote_index = pci_bdf_hex.rfind(":")   # get the index of the last occurrence of char : in str.
+                            correct_pci_bdf_hex = pci_bdf_hex[:last_quote_index] + "0." + pci_bdf_hex[last_quote_index+1:]
+
+                        if ii[0] == 'DeviceClass' and ii[1] == 'NetworkController':
+                            nic = 'True'
+                        if ii[0] == 'Description' and 'Ethernet' in ii[1]:
+                            nic = 'True'
+                        if ii[0] == 'Name' and 'Ethernet' in ii[1]:
+                            nic = 'True'
+                        if ii[0] == 'Description' and 'Network' in ii[1]:
+                            nic = 'True'
+                        if ii[0] == 'Name' and 'Network' in ii[1]:
+                            nic = 'True'
+
+                        if ii[0] == 'Oem':
+                            try:
+                                for iii in ii[1]['Dell']['DellPCIeFunction'].items():
+                                    if iii[0] == '@odata.id':
+                                        ethernet_port_slot = iii[1]
+                            except:
+                                pass
+                    if nic == 'True':
+                        full_pci_bdf = '0000:' + correct_pci_bdf_hex
+                        df_h_network.at[(df_h_network['vmnic_Device'] == full_pci_bdf), 'iDRAC_NIC_Slot'] = ethernet_port_slot.split('/')[-1].split('-')[0]
+                        df_h_network.at[(df_h_network['vmnic_Device'] == full_pci_bdf), 'iDRAC_EthernetPort_Slot'] = ethernet_port_slot.split('/')[-1]
+                        #print(df_h_network[['iDRAC_NIC_Slot', 'iDRAC_EthernetPort_Slot']])
+            except:
+                print(f"Unexpected failure while retrieving PCIe devices data from {idracName} iDRAC.")
 
         return df_h_network
 
-    def idrac_info(self, df_h_network):
-        """Collect iDRAC info for PCIe NIC Devices."""
+    def idrac_ethernetInterfaces(self, df_h_network, idrac_username, idrac_password):
+        """Collect iDRAC info.
+        
+        Code adapted from: https://github.com/dell/iDRAC-Redfish-Scripting/blob/e54ae3e03bf96c4f1cee563f64e696dcd67a2769/Redfish%20Python/GetSystemHWInventoryREDFISH.py#L547
 
-        #df_grouped = df_h_network.groupby('Host_Name')
-        #print(df_grouped['Host_Name'])
-        idracName = self.host_obj.name.split('.')[0].replace('hv','rs')
-        print(idracName)
-        #host = idracName
-        host = idracName
-        user = ""
-        passw = ""
+        
+        """
 
-        hwinventory = ""
+        #idracName = self.host_obj.name.split('.')[0].replace('hv','rs')
+        idracName = self.host_obj.name.replace('hv','rs')
 
-        #Connect to remote host
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            client.connect(hostname=host, username=user,password=passw)
-            stdin, stdout, stderr = client.exec_command('hwinventory')
-            hwinventory = stdout.read()
-            print(hwinventory)
+            response = requests.get('https://%s/redfish/v1/Systems/System.Embedded.1/NetworkInterfaces' % idracName,verify=False,auth=(idrac_username, idrac_password))
+            data = response.json()
         except:
-            pass
-        """
-        commands = ["racadm", "hwinventory"]
+            print(f"{idracName} iDRAC connection failure")
+        else:
+            try:
+                #message = "\n---- Network Device Information ----"
+                #print(message)
+                network_URI_list = []
+                for i in data['Members']:
+                    network = i['@odata.id']
+                    network_URI_list.append(network)
 
-        for command in commands:
-            stdin, stdout, stderr = client.exec_command('hwinventory')
-            hwinventory = stdout.read().decode()
-            print(stdout.read().decode()) 
-        """
-        return hwinventory
+                #if network_URI_list == []:
+                #    message = "\n- WARNING, no network information detected for system\n"
+                #    print(message)
+                    
+                for i in network_URI_list:
+                    #message = "\n- Network device details for %s -\n" % i.split("/")[-1]
+                    #print(message)
+                    i=i.replace("Interfaces","Adapters")
+                    response = requests.get('https://%s%s' % (idracName, i),verify=False,auth=(idrac_username, idrac_password))
+                    data = response.json()
+
+                    for ii in data.items():
+                        if ii[0] == 'NetworkPorts':
+                            network_port_urls = []
+                            url_port = ii[1]['@odata.id']
+                            response = requests.get('https://%s%s' % (idracName, url_port),verify=False,auth=(idrac_username, idrac_password))
+                            data = response.json()
+
+                            port_uri_list = []
+                            for i in data['Members']:
+                                port_uri_list.append(i['@odata.id'])
+
+                    for z in port_uri_list:
+                        response = requests.get('https://%s%s' % (idracName, z),verify=False,auth=(idrac_username, idrac_password))
+                        data = response.json()
+                        mac = ''
+                        slot = ''
+                        #message = "\n- Network port details for %s -\n" % z.split("/")[-1]
+                        #print(message)
+                        for ii in data.items():
+
+                            """
+                            if ii[0] == '@odata.id' or ii[0] == '@odata.context' or ii[0] == 'Metrics' or ii[0] == 'Links' or ii[0] == '@odata.type':
+                                pass
+                            elif ii[0] == 'Oem':
+                                try:
+                                    for iii in ii[1]['Dell']['DellSwitchConnection'].items():
+                                        if iii[0] == '@odata.context' or iii[0] == '@odata.type':
+                                            pass
+                                        else:
+                                            message = "%s: %s" % (iii[0], iii[1])
+                                            print(message)
+                                except:
+                                    pass
+                            else:
+                            """
+                            #message = "%s: %s" % (ii[0], ii[1])
+                            #print(message)
+                            if ii[0] == "AssociatedNetworkAddresses":
+                                mac = ii[1][0]
+                            if ii[0] == "@odata.id":
+                                slot = ii[1].split('/')[-1]
+
+                        #This one works for R740
+                        df_h_network.at[(df_h_network['iDRAC_EthernetPort_Slot'] == slot + '-1'), 'vmnic_MAC'] = mac.lower()   
+                        
+                        #This one works for R730
+                        #df_h_network.at[(df_h_network['vmnic_MAC'] == mac.lower()), 'iDRAC_EthernetPort_Slot'] = slot + '-1'
+                        #df_h_network.at[(df_h_network['vmnic_MAC'] == mac.lower()), 'iDRAC_NIC_Slot'] = slot.split('-')[0]
+            except:
+                print(f"Unexpected failure while retrieving Ethernet Interfaces data from {idracName} iDRAC.")
 
 
+        return df_h_network
+
+    def get_FW_inventory(self, df_h, idrac_username, idrac_password):
+        
+        idracName = self.host_obj.name.replace('hv','rs')
+
+        try:
+            #print('Starting Inventory Scan...')
+            req = requests.get('https://%s/redfish/v1/UpdateService/FirmwareInventory' % (idracName), auth=(idrac_username, idrac_password), verify=False)
+            statusCode = req.status_code
+        except:
+            print(f"{idracName} iDRAC connection failure")
+        else:
+            try:
+                data = req.json()
+                for i in data[u'Members']:
+                    for ii in i.items():
+                        if ii[0] == u'@odata.id':
+                            req = requests.get('https://{}{}'.format(idracName, ii[1]), auth=(idrac_username, idrac_password), verify=False)
+                            statusCode = req.status_code
+                            data2 = req.json()
+                            store = 'False'
+                            column_name = ''
+                            for iii in data2.items():
+                                #message = "\n%s: %s" % (iii[0], iii[1])
+                                #print(message)
+                                if iii[0] == 'Name':
+                                    if iii[1] == 'System CPLD':
+                                        store = 'True'
+                                        column_name = 'CPLD_Version'
+                                        #print("Name {}".format(iii[1]))
+                                    elif iii[1] == 'Lifecycle Controller':
+                                        store = 'True'
+                                        column_name = 'iDRAC_Version'
+                                        #print("Name {}".format(iii[1]))
+                                if iii[0] == 'Version' and store == 'True':
+                                    #print("Version {}".format(iii[1]))
+                                    df_h[column_name] = iii[1].strip()   # Removing spaces
+            except:
+                print(f"Unexpected failure while retrieving Inventory version data from {idracName} iDRAC.")
+
+            
+            # The code below does not work for all iDRACs (older ones fail loading the URL)
+            """
+            try:
+                #print('Starting Inventory Scan...')
+                #req = requests.get('https://%s/redfish/v1/UpdateService/FirmwareInventory?$expand=*($levels=1)' % (idracName), auth=(idrac_username, idrac_password), verify=False)
+                statusCode = req.status_code
+            except:
+                print("iDRAC connection failure")
+            else:
+                data = req.json()
+
+            for i in data[u'Members']:
+                store = 'False'
+                column_name = ''
+                for ii in i.items():
+                    
+                    #if ii[0] == u'@odata.type':
+                    #    #message = "\n%s: %s" % (ii[0], ii[1])
+                    #    #print(message)
+                    #    if ii[0] == 'Name':
+                    #        element_name = ii[1]
+                    #        #print(element_name)
+                    #    if ii[0] == 'Version':
+                    #        element_version = ii[1]
+                    #        #print(element_version)
+                    #    message = "\n"
+                    #elif ii[0] == "Oem":
+                    #    for iii in ii[1][u'Dell'][u'DellSoftwareInventory'].items():
+                    #        message = "%s: %s" % (iii[0], iii[1])
+                    #        #print(message)
+                    #        message = "\n"
+
+                    #else:
+                    
+                    #message = "%s: %s" % (ii[0], ii[1])
+                    #print(message)
+                    #message = "\n"
+                    if ii[0] == 'Name':
+                        if ii[1] == 'System CPLD':
+                            store = 'True'
+                            column_name = 'CPLD_Version'
+                        elif ii[1] == 'Lifecycle Controller':
+                            store = 'True'
+                            column_name = 'iDRAC_Version'
+                    if ii[0] == 'Version' and store == 'True':
+                        df_h[column_name] = ii[1]     
+            """
+
+        return df_h
+
+    def idrac_cgi(self, df_h, df_h_network, idrac_username, idrac_password):
+
+        idracName = self.host_obj.name.split('.')[0].replace('hv','rs')
+        
+        login_data = '<LOGIN><REQ><USERNAME>{}</USERNAME><PASSWORD>{}</PASSWORD></REQ></LOGIN>'.format(idrac_username, idrac_password)
+        login_header = "<?xml version='1.0'?>" + login_data
+        login_req_uri = 'https://{}/cgi-bin/{}'.format(idracName, 'login')  # First we need to log in to get the auth token
+        try:
+            login_req = requests.get(login_req_uri, data = login_header, verify=False)
+            req_status_code = login_req.status_code
+            req_content = login_req.text
+        except:
+            print(f"{idracName} iDRAC connection failure")
+        else:
+            if req_status_code == 200:
+                sid_pattern = re.compile('<SID>(.*)</SID>') 
+                pattern_match = sid_pattern.search(req_content)
+                if pattern_match:
+                    sid = pattern_match.group(1)    # Token to run our command in the next GET request
+                    #print(f"SID {sid}")
+
+                cookie = {'Cookie':f'sid={sid}'}
+                racadm_command = 'hwinventory'
+                racadm_command_data = '<EXEC><REQ><CMDINPUT>racadm {}</CMDINPUT><MAXOUTPUTLEN>0x0fff</MAXOUTPUTLEN></REQ></EXEC>'.format(racadm_command)
+                racadm_command_header = "<?xml version='1.0'?>" + racadm_command_data
+                racadm_command_req_uri = 'https://{}/cgi-bin/{}'.format(idracName, 'exec')  # We run the command by passing the token as a Cookie
+                try:
+                    racadm_command_req = requests.get(racadm_command_req_uri, data = racadm_command_header, cookies = cookie, verify=False)
+                    racadm_command_req_status_code = racadm_command_req.status_code
+                    racadm_command_req_content = racadm_command_req.text
+                except:
+                    print(f"Error while retrieving {idracName} iDRAC hwinventory: status code {racadm_command_req_status_code}")
+                else:
+                    if racadm_command_req_status_code == 200:
+                        nic_match = re.findall(r'(Device Type = NIC.*?-----)', racadm_command_req_content, re.DOTALL)   # Avoiding regex greddiness
+                        for nic in nic_match:
+                            pattern_bus = re.compile(r'BusNumber = (.*)')
+                            m = pattern_bus.search(nic)
+                            bus = m.group(1)
+                            bus_hex = format(int(bus), 'x').zfill(2)    # zfill() method to pad a string with zeros
+
+                            pattern_device = re.compile(r'DeviceNumber = (.*)')
+                            m = pattern_device.search(nic)
+                            device = m.group(1)
+                            device_hex = format(int(device), 'x').zfill(2)    # zfill() method to pad a string with zeros
+
+                            pattern_function = re.compile(r'FunctionNumber = (.*)')
+                            m = pattern_function.search(nic)
+                            function = m.group(1)
+                            function_hex = format(int(function), 'x')
+
+                            bdf_hex = '0000:' + bus_hex + ':' + device_hex + '.' + function_hex
+
+                            pattern_mac = re.compile(r'CurrentMACAddress = (.*)')
+                            m = pattern_mac.search(nic)
+                            mac = m.group(1)
+                            df_h_network.at[(df_h_network['vmnic_Device'] == bdf_hex), 'vmnic_MAC'] = mac.lower()
 
 
+                            pattern_port_slot = re.compile(r'FQDD = (.*)')
+                            m = pattern_port_slot.search(nic)
+                            port_slot = m.group(1)
+                            nic_slot = port_slot.split('-')[0]
+                            df_h_network.at[(df_h_network['vmnic_Device'] == bdf_hex), 'iDRAC_NIC_Slot'] = nic_slot
+                            df_h_network.at[(df_h_network['vmnic_Device'] == bdf_hex), 'iDRAC_EthernetPort_Slot'] = port_slot
 
+                        version_match = re.findall(r'(\[InstanceID: System.Embedded.1\].*?-----)', racadm_command_req_content, re.DOTALL)
+
+                        for version in version_match:
+                            pattern_idrac = re.compile(r'LifecycleControllerVersion = (.*)')
+                            m = pattern_idrac.search(version)
+                            idrac_version = m.group(1)
+                            df_h['iDRAC_Version'] = idrac_version.strip()   # Removing spaces
+
+                            pattern_cpld = re.compile(r'CPLDVersion = (.*)')
+                            m = pattern_cpld.search(version)
+                            cpld_version = m.group(1)
+                            df_h['CPLD_Version'] = cpld_version.strip() # Removing spaces
+
+        return df_h, df_h_network

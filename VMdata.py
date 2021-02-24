@@ -1,5 +1,7 @@
 from math import ceil # Used to find the nearest integer that is greater than or equal to a given number
 import re
+from datetime import datetime, timezone
+
 class VMdata:
     'Retrieve VM configuration data'
 
@@ -7,7 +9,18 @@ class VMdata:
     def __init__(self, vm_obj):
         self.vm_obj = vm_obj
 
-    
+    def vmMOID_calculator(self):
+        """Return the MOID of the Host."""
+
+        return self.vm_obj._moId
+
+    def timestamp_calculator(self):
+        """Return current timestamp in ISO8601 format.""" 
+
+        current_time = datetime.now(timezone.utc)
+
+        return current_time.isoformat()
+     
     def actualUsage_calculator(self):
         """Return the actual storage space (GB) consumed by a given VM."""
 
@@ -28,6 +41,11 @@ class VMdata:
             snapshot = 'True'
 
         return snapshot
+    
+    def UUID_calculator(self):
+        """Return the UUID of a given VM."""
+
+        return self.vm_obj.config.uuid
 
     def hddCapacity_calculator(self):
         """Return aggregated provisioned capacity (GB) for a given VM."""
@@ -263,7 +281,15 @@ class VMdata:
 
     def sriovVirtualInterfaces_calculator(self):
         """Return the amount of SRIOV vNICs in current VM."""
- 
+        """
+        pattern_sriov = re.compile(r'(pciPassthru[0-9]{1,2})\.')      # Regex pattern matching SRIOV devices
+
+        sriov_set = set()
+        for option in self.vm_obj.config.extraConfig:
+            pattern_match = pattern_sriov.search(option.key)
+            if pattern_match:
+                sriov_set.add(pattern_match.group(1))
+        """
         sriov_vnics_count = 0
         for device in self.vm_obj.config.hardware.device:
             if "SR-IOV" in device.deviceInfo.label:
@@ -298,5 +324,203 @@ class VMdata:
         """Return Virtual Hardware version for current VM."""
 
         return self.vm_obj.config.version
+    
+    def hostMOID_calculator(self):
+        """Return the MOID of the Host in which this VM runs."""
 
+        return self.vm_obj.runtime.host._moId
+
+    def get_vnic_type(self, device):
+        """Return vNIC info for the current VM."""
+        
+        vnic_type = ""
+        if "VirtualSriovEthernetCard" in str(type(device)):
+            vnic_type = "SR-IOV"
+        elif "VirtualPCIPassthrough" in str(type(device)):
+            vnic_type = "PCI-PT"
+        elif "VirtualVmxnet3" in str(type(device)):
+            vnic_type = "vmxnet3"
+        elif "VirtualE1000" in str(type(device)):
+            vnic_type = "e1000"
+
+        return vnic_type
+
+    def get_vnic_pmSessions(self, device):
+        """Return Port Mirror sessions of current vnic... is any."""
+
+        vnic_portKey = device.backing.port.portKey
+        vnic_pmSession = ""
+        analysed_DVS = []  
+        for dpg in self.vm_obj.network:
+            if 'DistributedVirtualPortgroup' in str(type(dpg)): # Only works for dVS objects
+                if dpg.config.distributedVirtualSwitch.name not in analysed_DVS:
+                    for pmSession in dpg.config.distributedVirtualSwitch.config.vspanSession:
+                        if pmSession.enabled:
+                            if (vnic_portKey in pmSession.sourcePortReceived.portKey) or (vnic_portKey in pmSession.sourcePortTransmitted.portKey):
+                                vnic_pmSession = pmSession.name
+                                break
+                    analysed_DVS.append(dpg.config.distributedVirtualSwitch.name)
+
+        return vnic_pmSession
+
+    def get_dpg_name(self, portgroupKey):
+        """Return dpg name."""
+        
+        dpg_name = ""
+        for dpg in self.vm_obj.network:
+            if 'DistributedVirtualPortgroup' in str(type(dpg)):
+                if portgroupKey == dpg.key:
+                    dpg_name = dpg.name
+                    break
+        
+        return dpg_name
+
+    def get_dpg_security(self, dpg_name):
+        """Get DPG security parameters."""
+
+        promiscuous = ""
+        macChange = ""
+        forged = ""
+        for dpg in self.vm_obj.network:
+            if dpg_name == dpg.name:
+                promiscuous = dpg.config.defaultPortConfig.securityPolicy.allowPromiscuous.value
+                macChange = dpg.config.defaultPortConfig.securityPolicy.macChanges.value
+                forged = dpg.config.defaultPortConfig.securityPolicy.forgedTransmits.value
+                break
+
+        return promiscuous, macChange, forged
+
+    def get_dpg_vlans(self, vnic_dpg_name):
+        """Resturn list of vlans in a DPG."""
+
+        vlan_list = []
+        for dpg in self.vm_obj.network:
+            if vnic_dpg_name == dpg.name:
+                if "Range" in str(type(dpg.config.defaultPortConfig.vlan.vlanId)):
+                    for item in dpg.config.defaultPortConfig.vlan.vlanId:
+                        if item.start != item.end:
+                            range_string = "{}-{}".format(item.start, item.end)
+                        else:
+                            range_string = item.start
+                        vlan_list.append(range_string)
+                        #vlan_list += list(range(item.start, item.end + 1, 1))
+                elif "int" in str(type(dpg.config.defaultPortConfig.vlan.vlanId)):
+                    vlan_list.append(dpg.config.defaultPortConfig.vlan.vlanId)
+
+                break
+
+        return vlan_list
+
+    def get_dpg_active_uplinks(self, vnic_dpg_name, vnic_dvs_name):
+        """Return active and standby uplinks in a DPG."""
+
+        active_list = []
+        standby_list = []
+        uplink_dic = {} # {"Uplink": "vmnic"}
+        for dvs in self.vm_obj.summary.runtime.host.config.network.proxySwitch:
+            if dvs.dvsName == vnic_dvs_name:
+                for uplink in dvs.uplinkPort:
+                    for item in dvs.spec.backing.pnicSpec:
+                        if uplink.key == item.uplinkPortKey:
+                            uplink_dic[uplink.value] = item.pnicDevice       
+
+        for dpg in self.vm_obj.network:
+            if vnic_dpg_name == dpg.name:
+                for uplink in dpg.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder.activeUplinkPort:
+                    if uplink in uplink_dic.keys():
+                        active_list.append(uplink_dic[uplink])
+                for uplink in dpg.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder.standbyUplinkPort:
+                    if uplink in uplink_dic.keys():
+                        standby_list.append(uplink_dic[uplink])
+                break
+
+        return active_list, standby_list
+
+    def get_dvs_name(self, vnic_dpg_name):
+        """Return dvs name."""
+
+        dvs_name = ""
+        for dpg in self.vm_obj.network:
+            if vnic_dpg_name == dpg.name:
+                dvs_name = dpg.config.distributedVirtualSwitch.name
+                break
+
+        return dvs_name
+
+    def get_dvs_lldp(self, vnic_dpg_name):
+        """Return dVS LLDP status."""
+
+        lldp = "false"
+        for dpg in self.vm_obj.network:
+            if vnic_dpg_name == dpg.name:
+                if "lldp" in dpg.config.distributedVirtualSwitch.config.linkDiscoveryProtocolConfig.protocol:
+                    lldp = "True"
+                break
+
+        return lldp
+    
+    def get_dpg_lb_policy(self, vnic_dpg_name):
+        """Return DPG Loadbalancing Policy."""
+
+        #Dictionary of possible loadbalancing models
+        dpg_lb = {'loadbalance_ip': 'Route based on IP hash', 
+            'loadbalance_srcmac': 'Route based on source MAC hash', 
+            'loadbalance_srcid': 'Route based on originating virtual port', 
+            'failover_explicit': 'Use explicit failover order', 
+            'loadbalance_loadbased': 'Route based on physical NIC load'}
+
+        policy = ""
+        for dpg in self.vm_obj.network:
+            if vnic_dpg_name == dpg.name:
+                policy = dpg_lb[dpg.config.defaultPortConfig.uplinkTeamingPolicy.policy.value]
+
+        return policy
+    
+    def pcislot_order(self, df_v_network):
+        """Calculate PCI Slot order as presented to the GuestOS."""
+
+        if self.vm_obj.runtime.powerState == 'poweredOn':
+            df_v_network['temp_pci_order'] = ""
+            #df_v_network['vNIC_pciSlotNumber'] = df_v_network['vNIC_pciSlotNumber'].astype(int, errors = 'ignore')
+            for index, row in df_v_network.iterrows():
+                if df_v_network.at[index, 'vNIC_pciSlotNumber'] != '':
+                    slot = df_v_network.at[index, 'vNIC_pciSlotNumber']
+                    slot_bin = bin(slot)[2:].zfill(12) # Slot to binary and add leading zeros to get a uniform length binary number
+                    domain_bin = slot_bin[-5:]
+                    bus_bin = slot_bin[-10:-5]
+                    function_bin = slot_bin[-12:-10]
+
+                    pciBridge =  int(bus_bin, 2) - 1    # According to VMware docs is the formula to identify VM pciBridge
+                    pciBridgeSlot = ""
+                    
+                    #for opts in self.vm_obj.config.extraConfig:
+                    #    if opts.key == f'pciBridge{pciBridge}.pciSlotNumber':
+                    #        pciBridgeSlot = (opts.value)
+                    #        break
+                    
+                    #print(pciBridge)
+                    #print(pciBridgeSlot)
+
+                    # vNIC order wil be determined by their connected pciBridge (the lower the bridge number the higher in the order list) and by their function (does not apply to e1000)
+                    # To take into account both factors, we will store in float format pciBridge.function in the "pci_order" variable (ie, 4.1, 5.2...)
+                    # "pci_order" will be stored in a new column that will be used to sort the DF
+                    if row.vNIC_Type == 'e1000':
+                        #pci_order = int(pciBridgeSlot) + int(slot)*0.01 ---> Original working
+                        pci_order = int(pciBridge) + int(slot)*0.01
+                    else:
+                        #pci_order = int(pciBridgeSlot) + int(function_bin, 2)*0.1 ---> Original working
+                        pci_order = int(pciBridge) + int(function_bin, 2)*0.1
+                        
+                    df_v_network.at[index, 'temp_pci_order'] = pci_order
+            if len(df_v_network[df_v_network['vNIC_pciSlotNumber'] == ''].index) == 0:  # There are no empty cells in column "vNIC_pciSlotNumber". If there are, ordering fails
+                df_v_network = df_v_network.sort_values(by=['temp_pci_order'])
+                df_v_network = df_v_network.reset_index(drop = True)
+                df_v_network['vNIC_GuestOS_Mapping_Order'] = df_v_network.index + 1
+
+            df_v_network = df_v_network.drop(columns=['temp_pci_order'])
+            
+        else:
+            df_v_network['vNIC_GuestOS_Mapping_Order'] = 'poweredOff'
+
+        return df_v_network
 
